@@ -1,6 +1,7 @@
 #pragma once
 
 #include <vector>
+#include "common/cpu_features.h"
 
 #ifdef _MSC_VER
 #define __builtin_popcountl __popcnt64
@@ -47,6 +48,30 @@ namespace lsh {
       dist += popcount(queryRow[i] ^ codeRow[i]);
     return dist;
   }
+  
+  #ifdef _ARCH_X86_64
+    // AVX512 Vectorized version of hamming distance computation.
+    // The implementation uses AVX512 and VPOPCNTDQ ISA available on a subset of x86_64 platforms. 
+    // Using this version requires compile time and runtime checks to ensure feature support. 
+    template <size_t StepsStatic, bool Dynamic=false> 
+    inline DistType hamming_avx512(ChunkType* queryRow, ChunkType* codeRow, int stepsDynamic = 0) {
+      static_assert(Dynamic == true || StepsStatic != 0, "Either define dynamic use of steps or provide non-zero template argument");
+      __m512i qR = _mm512_load_epi64(queryRow);
+      __m512i cR = _mm512_load_epi64(codeRow);
+      __m512i xorResult = _mm512_xor_si512(qR, cR);
+      __m512i dist = _mm512_popcnt_epi64(xorResult);
+
+      qR = _mm512_load_epi64(queryRow + 8);
+      cR = _mm512_load_epi64(codeRow + 8);
+      xorResult = _mm512_xor_si512(qR, cR);      
+      dist = _mm512_add_epi64(dist, _mm512_popcnt_epi64(xorResult));
+      
+      // Reduce adds are highly ineffieinct and to be used with caution. Still >10x faster than scalar implementation.
+      return _mm512_reduce_add_epi64(dist); 
+    }
+    // vpopcntdq is only part of AVX512. So AVX512 ISA support is needed even for 256 or 128 bit implementations. 
+
+  #endif
 
   template <int warpSize, int NumCodeRows, int BytesPerVector, bool Dynamic, class Functor>
   inline void hammingTopKUnrollWarp(int queryOffset, const Parameters& parameters, const Functor& gather) {
@@ -70,24 +95,57 @@ namespace lsh {
       minDist[warpRowId] = (DistType)numBits;
     }
 
-    for(IndexType codeRowId = 0; codeRowId < (IndexType)getStaticOrDynamic<NumCodeRows, Dynamic>(parameters.numCodeRows); ++codeRowId, codeRow += getStaticOrDynamic<StepStatic, Dynamic>(stepDynamic)) {
-      ChunkType* queryRow = (ChunkType*)parameters.queryRows;
-      for(IndexType warpRowId = 0; warpRowId < warpSize; warpRowId++, queryRow += getStaticOrDynamic<StepStatic, Dynamic>(stepDynamic)) {
-        // Compute the bit-wise hamming distance
-        DistType dist = hamming<StepStatic, Dynamic>(queryRow, codeRow, stepDynamic);
-      
-        // Record the minimal distance seen for this query vector wrt. all weight vectors
-        if(dist < minDist[warpRowId]) {
-          minDist[warpRowId] = dist;
+#ifdef _ARCH_X86_64
+    // Using function pointers or functioanl to dispatch to  platform-specific implementations of the hamming algorithm is cleaner.
+    // However, the templatized nature of this call stack makes it less maintainable. 
+    // A specialized implementation hammingTopK<32000,128> is under exploration. 
+
+    if(CpuFeatures::isVPOPCNTDQSupported()) { // Runtime platform support check
+      for(IndexType codeRowId = 0; codeRowId < (IndexType)getStaticOrDynamic<NumCodeRows, Dynamic>(parameters.numCodeRows); ++codeRowId, codeRow += getStaticOrDynamic<StepStatic, Dynamic>(stepDynamic)) {
+        ChunkType* queryRow = (ChunkType*)parameters.queryRows;
+        for(IndexType warpRowId = 0; warpRowId < warpSize; warpRowId++, queryRow += getStaticOrDynamic<StepStatic, Dynamic>(stepDynamic)) {
+
+          // Compute the bit-wise hamming distance using avx512 and vpopcntdq instruction 
+          DistType dist = hamming_avx512<StepStatic, Dynamic>(queryRow, codeRow, stepDynamic);
+          
+          // Record the minimal distance seen for this query vector wrt. all weight vectors
+          if(dist < minDist[warpRowId]) {
+            minDist[warpRowId] = dist;
+          }
+
+          // Record the number of weight vectors that have this distance from the query vector.
+          // Note, because there is at most numBits different distances this can be trivially done.
+          // Not the case for generic distances like float.
+          counter[warpRowId][dist]++;
+
+          // Record the distance for this weight vector
+          distBuffer[warpRowId][codeRowId] = dist;
         }
+      }
+    }
+    else
+#endif
+    {
+      for(IndexType codeRowId = 0; codeRowId < (IndexType)getStaticOrDynamic<NumCodeRows, Dynamic>(parameters.numCodeRows); ++codeRowId, codeRow += getStaticOrDynamic<StepStatic, Dynamic>(stepDynamic)) {
+        ChunkType* queryRow = (ChunkType*)parameters.queryRows;
+        for(IndexType warpRowId = 0; warpRowId < warpSize; warpRowId++, queryRow += getStaticOrDynamic<StepStatic, Dynamic>(stepDynamic)) {
+          
+          // Compute the bit-wise hamming distance
+          DistType dist = hamming<StepStatic, Dynamic>(queryRow, codeRow, stepDynamic);
 
-        // Record the number of weight vectors that have this distance from the query vector.
-        // Note, because there is at most numBits different distances this can be trivially done.
-        // Not the case for generic distances like float.
-        counter[warpRowId][dist]++;
+          // Record the minimal distance seen for this query vector wrt. all weight vectors
+          if(dist < minDist[warpRowId]) {
+            minDist[warpRowId] = dist;
+          }
 
-        // Record the distance for this weight vector
-        distBuffer[warpRowId][codeRowId] = dist;
+          // Record the number of weight vectors that have this distance from the query vector.
+          // Note, because there is at most numBits different distances this can be trivially done.
+          // Not the case for generic distances like float.
+          counter[warpRowId][dist]++;
+
+          // Record the distance for this weight vector
+          distBuffer[warpRowId][codeRowId] = dist;
+        }
       }
     }
     // warp finished, harvest k top distances
